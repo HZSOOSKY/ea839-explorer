@@ -26,10 +26,14 @@
       <span class="sub">Interactive Teardown Visualization</span>
     </div>
     <div class="spacer"></div>
-    <div class="tb-stat"><span class="dot"></span>系统就绪</div>
+    <div class="tb-stat" id="stat-mode">视图：透视</div>
     <div class="tb-stat">FPS <b id="fps">60</b></div>
     <div class="tb-stat">3996 cc · 90° V8 · 32V</div>
     <div class="tb-stat">550 PS / 770 Nm</div>
+    <div class="btn-row">
+      <button class="btn" id="btn-intro">应用介绍</button>
+      <button class="btn" id="btn-cars">应用车型</button>
+    </div>
   </header>
 
   <!-- 左侧：组件清单 -->
@@ -58,17 +62,63 @@
   <!-- 左下：操作引导 -->
   <div id="guide">
     <h3>操作引导 <span class="en">GUIDE</span></h3>
-    <div class="guide-row"><span class="key">拖拽</span><span>旋转视角</span></div>
-    <div class="guide-row"><span class="key">滚轮</span><span>缩放模型</span></div>
-    <div class="guide-row"><span class="key">右键拖拽</span><span>平移视图</span></div>
+    <div class="guide-row"><span class="key">拖拽 / 滚轮</span><span>旋转 · 缩放 · 右键平移</span></div>
     <div class="guide-row"><span class="key">点击部件</span><span>查看详情并拆解</span></div>
+    <div class="guide-row"><span class="key">1 / 2 / 3 / 4</span><span>等轴 / 正视 / 侧视 / 俯视</span></div>
     <div class="guide-row"><span class="key">E / R</span><span>全部拆解 / 复位</span></div>
     <div class="guide-row"><span class="key">空格 / F / L</span><span>运转 / 聚焦 / 标注</span></div>
-    <div class="guide-row"><span class="key">Q</span><span>画质：高 / 流畅</span></div>
-    <div class="guide-row"><span class="key">ESC</span><span>取消选择</span></div>
+    <div class="guide-row"><span class="key">X / C / G</span><span>透视 / 剖切 / 轨迹</span></div>
+    <div class="guide-row"><span class="key">H / T / P</span><span>隐藏 / 导览 / 截图</span></div>
+    <div class="guide-row"><span class="key">Q / I / ESC</span><span>画质 / 介绍 / 取消</span></div>
     <div class="guide-note">
-      提示：点击模型中的高亮部件会触发该部件的拆解动画，并同步展示其材料、工艺与性能参数。<br>
-      标注默认只跟随「选中 / 悬停 / 已拆解」的部件；帧率偏低时会自动切换到流畅画质，也可按 Q 手动切换。
+      提示：点击模型中的高亮部件会触发该部件的拆解动画，并同步展示其材料、工艺与性能参数。
+      完整功能与全部快捷键请按 <b>I</b> 打开应用介绍。
+    </div>
+  </div>
+
+  <!-- 底部控制区：第二排工具条 + 主控制台（垂直堆叠，自动避让换行） -->
+  <div id="dock">
+  <!-- 第二排工具栏：视角 / 视图模式 / 工具 -->
+  <div id="tools">
+    <div class="con-group">
+      <span class="con-label">视角预设</span>
+      <div class="btn-row">
+        <button class="btn sm" data-view="0">等轴</button>
+        <button class="btn sm" data-view="1">正视</button>
+        <button class="btn sm" data-view="2">侧视</button>
+        <button class="btn sm" data-view="3">俯视</button>
+      </div>
+    </div>
+    <div class="con-group">
+      <span class="con-label">视图模式</span>
+      <div class="btn-row">
+        <button class="btn" id="btn-xray">X 光</button>
+        <button class="btn" id="btn-clip">剖切</button>
+        <button class="btn" id="btn-trails">轨迹</button>
+      </div>
+    </div>
+    <div class="con-group">
+      <span class="con-label">工具</span>
+      <div class="btn-row">
+        <button class="btn" id="btn-tour">导览</button>
+        <button class="btn" id="btn-hide">隐藏</button>
+        <button class="btn" id="btn-shot">截图</button>
+      </div>
+    </div>
+    <div class="con-group">
+      <span class="con-label">显示</span>
+      <div class="btn-row">
+        <button class="btn" id="btn-labels">标注：智能</button>
+        <button class="btn" id="btn-quality">画质：高</button>
+        <button class="btn active" id="btn-help">引导</button>
+      </div>
+    </div>
+    <div class="con-group">
+      <span class="con-label">剖切位置</span>
+      <div class="slider-row">
+        <input type="range" id="clip-slider" min="-70" max="70" step="1" value="70">
+        <span class="slider-val" id="clip-val">关</span>
+      </div>
     </div>
   </div>
 
@@ -103,12 +153,31 @@
         <span class="slider-val" id="rpm-val">600 rpm</span>
       </div>
     </div>
-    <div class="con-group">
-      <span class="con-label">显示</span>
-      <div class="btn-row">
-        <button class="btn" id="btn-labels">标注：智能</button>
-        <button class="btn" id="btn-quality">画质：高</button>
-        <button class="btn active" id="btn-help">引导</button>
+  </div>
+  </div>
+
+  <!-- 应用介绍浮层 -->
+  <div id="intro" class="hidden">
+    <div class="intro-mask" id="intro-mask"></div>
+    <div class="intro-box">
+      <div class="intro-head">
+        <div class="intro-title">
+          保时捷 <span class="accent">EA839</span> 4.0 V8
+          <span class="intro-sub">交互式拆解可视化 · 应用说明</span>
+        </div>
+        <div class="spacer"></div>
+        <nav class="intro-tabs">
+          <button class="itab active" data-tab="features">功能介绍</button>
+          <button class="itab" data-tab="cars">应用车型</button>
+          <button class="itab" data-tab="spec">技术规格</button>
+          <button class="itab" data-tab="keys">快捷键</button>
+        </nav>
+        <button class="intro-close" id="intro-close" title="关闭 (ESC)">✕</button>
+      </div>
+      <div class="intro-body" id="intro-body"></div>
+      <div class="intro-foot">
+        <span>数据依据大众集团 / 保时捷公开技术资料整理，不同年款与市场存在差异，仅供工程演示与教学参考。</span>
+        <label class="intro-never"><input type="checkbox" id="intro-auto" checked> 启动时自动打开</label>
       </div>
     </div>
   </div>

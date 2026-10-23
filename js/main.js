@@ -9,6 +9,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { buildEngine, DIM } from './engine.js';
 import { PARTS, PART_MAP, GROUPS } from './parts.js';
+import { FEATURES, VEHICLES, SPECS, KEYS } from './data.js';
 
 const $ = s => document.querySelector(s);
 const $$ = s => Array.from(document.querySelectorAll(s));
@@ -20,19 +21,27 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true,
 renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 1.5));
 renderer.setSize(innerWidth, innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.18;
+renderer.toneMappingExposure = 1.10;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 // 阴影改为按需更新：方向光阴影与相机无关，只有部件移动（拆解/运转）时才需要重画
 renderer.shadowMap.autoUpdate = false;
 renderer.shadowMap.needsUpdate = true;
+// 剖切视图依赖材质级裁剪平面
+renderer.localClippingEnabled = true;
 
 const scene = new THREE.Scene();
 scene.fog = new THREE.FogExp2(0x040810, 0.0042);
 
 const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.5, 800);
-camera.position.set(104, 70, 74);
+const FIT_BASE = new THREE.Vector3(116, 76, 82);
+// 窄屏两侧栏占掉的视觉宽度更多，相机相应后撤，避免模型被半透明面板压住
+const fitK = Math.max(
+  innerWidth < 1400 ? 1.24 : innerWidth < 1600 ? 1.10 : 1,
+  innerHeight > 950 ? 1.12 : 1
+);
+camera.position.copy(FIT_BASE).multiplyScalar(fitK);
 
 const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
@@ -42,10 +51,14 @@ controls.maxDistance = 400;
 controls.maxPolarAngle = Math.PI * 0.88;
 controls.target.set(0, 6, 0);
 controls.autoRotateSpeed = 0.55;
+// 拆解展开时的相机后撤以此为基准，避免「一展开反而先贴近」的跳变
+const baseDist = camera.position.distanceTo(controls.target);
 
-/* ================= 灯光 ================= */
-scene.add(new THREE.AmbientLight(0x36546a, 0.75));
-scene.add(new THREE.HemisphereLight(0x5a8fb5, 0x0d141c, 0.95));
+/* ================= 灯光 =================
+   启用环境贴图后 IBL 已承担一部分环境照明，故环境光 / 半球光相应下调，
+   避免金属件整体过曝。 */
+scene.add(new THREE.AmbientLight(0x36546a, 0.52));
+scene.add(new THREE.HemisphereLight(0x5a8fb5, 0x0d141c, 0.62));
 
 const key = new THREE.DirectionalLight(0xdcf0ff, 2.9);
 key.position.set(60, 90, 70);
@@ -73,6 +86,42 @@ scene.add(under);
 const core = new THREE.PointLight(0x48dcff, 300, 150, 2);
 core.position.set(0, 4, 0);
 scene.add(core);
+
+/* ================= 程序化环境贴图 =================
+   金属件（缸体 / 曲轴 / 涡轮）在没有环境反射时只能靠漫反射着色，观感发灰发闷。
+   这里用几个自发光面片搭一个极简「灯箱」，经 PMREM 卷积成 IBL 环境贴图。
+   渲染只发生一次，之后每帧只是多一次纹理采样，成本可忽略，但金属高光与
+   轮廓反射会明显立体。 */
+let envTex = null;
+(function buildEnvironment() {
+  const env = new THREE.Scene();
+  const room = new THREE.Mesh(
+    new THREE.BoxGeometry(80, 80, 80),
+    new THREE.MeshBasicMaterial({ color: 0x0b141d, side: THREE.BackSide })
+  );
+  env.add(room);
+  const panel = (color, w, h, pos, rot) => {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color }));
+    m.position.set(pos[0], pos[1], pos[2]);
+    if (rot) m.rotation.set(rot[0], rot[1], rot[2]);
+    env.add(m);
+  };
+  // 顶部主光（冷白）
+  panel(0xdff1ff, 46, 46, [0, 38, 0], [Math.PI / 2, 0, 0]);
+  // 侧向补光：青 / 琥珀，对应 UI 主色，让高光带有环境色倾向
+  panel(0x2e7fa8, 40, 26, [-38, 4, 0], [0, Math.PI / 2, 0]);
+  panel(0x7a4f18, 40, 26, [38, 2, 0], [0, -Math.PI / 2, 0]);
+  panel(0x1d5f80, 46, 22, [0, 2, -38], [0, 0, 0]);
+  panel(0x101a24, 46, 30, [0, -6, 38], [0, Math.PI, 0]);
+
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  pmrem.compileEquirectangularShader();
+  envTex = pmrem.fromScene(env, 0.03).texture;
+  scene.environment = envTex;
+  pmrem.dispose();
+  room.geometry.dispose();
+  env.traverse(o => { if (o.isMesh) o.material.dispose(); });
+})();
 
 /* ================= 科技感背景：地面网格 + 环形光晕 ================= */
 const grid = new THREE.GridHelper(420, 56, 0x1d5f80, 0x0d2a3a);
@@ -132,7 +181,34 @@ for (const [id, rec] of parts) {
   if (!meta) continue;
   const dir = new THREE.Vector3(...meta.explode);
   if (dir.lengthSq() > 0) rec.offset.copy(dir.normalize().multiplyScalar(meta.dist));
+  // 环境反射强度略作收敛，保留金属质感又不至于把暗部提亮
+  for (const m of rec.mats) if ('envMapIntensity' in m.mat) m.mat.envMapIntensity = 0.72;
 }
+
+/* ---------- 拆解轨迹引导线 ----------
+   每条线段 = 该部件标注锚点从装配位到拆解位的运动轨迹，一次性构建，零逐帧开销。 */
+const trails = (function buildTrails() {
+  const usable = [];
+  for (const [id, rec] of parts) if (rec.label && rec.offset.lengthSq() > 0) usable.push(rec);
+  const pos = new Float32Array(usable.length * 6);
+  usable.forEach((rec, i) => {
+    const a = rec.label, b = rec.offset;
+    pos.set([a[0], a[1], a[2], a[0] + b.x, a[1] + b.y, a[2] + b.z], i * 6);
+  });
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const line = new THREE.LineSegments(g, new THREE.LineBasicMaterial({
+    color: 0x48dcff, transparent: true, opacity: 0.34, depthWrite: false,
+  }));
+  line.visible = false;
+  line.frustumCulled = false;
+  root.add(line);
+  return line;
+})();
+
+/* ---------- 剖切平面 ----------
+   法线指向 -X：保留 x <= constant 的一侧，滑块直接控制 constant。 */
+const clipPlane = new THREE.Plane(new THREE.Vector3(-1, 0, 0), 70);
 
 /* ================= 后期处理 ================= */
 /* Bloom 以半分辨率运行：辉光本身是低频模糊，降采样肉眼几乎无差，
@@ -163,7 +239,22 @@ const state = {
   master: 0,              // 爆炸插值
   frame: 0,
   fps: 60,
+  xray: false,            // X 光透视：选中部件以外半透明
+  clip: false,            // 剖切视图
+  clipPos: 70,            // 剖切面位置（世界 X）
+  trails: false,          // 拆解轨迹引导线
+  hidden: new Set(),      // 被隐藏的部件 id
+  tour: null,             // 自动导览状态 { i, timer }
+  view: 0,                // 当前视角预设
 };
+
+/* 标准工程视角预设（相机位置，观察目标统一为整机中心上方） */
+const VIEWS = [
+  { key: 'iso', name: '等轴', pos: [116, 76, 82] },
+  { key: 'front', name: '正视', pos: [0, 18, 158] },
+  { key: 'side', name: '侧视', pos: [158, 16, 4] },
+  { key: 'top', name: '俯视', pos: [0, 205, 42] },
+];
 
 const partState = new Map();  // id -> { master: 0, solo: 0 }
 for (const id of parts.keys()) partState.set(id, { master: 0, solo: 0 });
@@ -286,6 +377,7 @@ function selectPart(id, toggle = false) {
   $$('.cat-item').forEach(el => el.classList.toggle('sel', el.dataset.id === state.selected));
   showDetail(state.selected ? PART_MAP[state.selected] : null);
   applyHighlight();
+  refreshXray();
   updateLabels();
 }
 
@@ -312,7 +404,8 @@ function pickAt(cx, cy) {
   for (const h of hits) {
     let o = h.object;
     while (o && !o.userData.partId) o = o.parent;
-    if (o && o.userData.partId) return o.userData.partId;
+    // Raycaster 不检查 visible，被隐藏的部件需要自己过滤掉，否则会「隔空点中」
+    if (o && o.userData.partId && !state.hidden.has(o.userData.partId)) return o.userData.partId;
   }
   return null;
 }
@@ -408,6 +501,7 @@ function updateLabels() {
   for (const [id, rec] of parts) {
     const el = labelEls.get(id);
     if (!el) continue;
+    if (state.hidden.has(id)) { hideLabel(el); continue; }
     if (mode.key === 'smart' && !globalExplode) {
       const focused = id === state.selected || id === state.hover || state.exploded.has(id);
       if (!focused) { hideLabel(el); continue; }
@@ -482,6 +576,223 @@ function focusPart(id) {
 }
 let camAnim = null;
 
+/* ================= 视角预设 ================= */
+function flyTo(pos, target, dur = 0.9) {
+  camAnim = {
+    t: 0, dur,
+    fromT: controls.target.clone(), toT: target.clone(),
+    fromP: camera.position.clone(), toP: pos.clone(),
+  };
+}
+
+function applyView(i) {
+  state.view = i;
+  const v = VIEWS[i];
+  // 拆解展开时整机跨度变大，各视角按拆解程度同步后撤
+  const k = fitK * (1 + state.master * 0.55);
+  flyTo(
+    new THREE.Vector3(v.pos[0] * k, v.pos[1] * k, v.pos[2] * k),
+    new THREE.Vector3(0, 6 + state.master * 6, 0)
+  );
+  $$('[data-view]').forEach(el => el.classList.toggle('active', +el.dataset.view === i));
+  toast('视角：' + v.name);
+}
+
+/* ================= X 光透视 ================= */
+function refreshXray() {
+  if (!state.xray) return;
+  for (const [id, rec] of parts) {
+    const ghost = id !== state.selected;
+    for (const m of rec.mats) {
+      const mat = m.mat;
+      if (mat.__xop == null) { mat.__xop = mat.opacity; mat.__xtr = mat.transparent; mat.__xdw = mat.depthWrite; }
+      if (ghost) {
+        mat.transparent = true; mat.opacity = 0.13; mat.depthWrite = false;
+      } else {
+        mat.opacity = mat.__xop; mat.transparent = mat.__xtr; mat.depthWrite = mat.__xdw;
+      }
+      mat.needsUpdate = true;
+    }
+  }
+}
+
+function setXray(on) {
+  state.xray = on;
+  const btn = $('#btn-xray');
+  if (btn) { btn.classList.toggle('active', on); btn.textContent = on ? 'X 光 · 开' : 'X 光'; }
+  if (on) {
+    refreshXray();
+    toast(state.selected ? 'X 光透视：仅「' + PART_MAP[state.selected].name + '」保持实体' : 'X 光透视已开启（选中部件后其余零件将半透明）');
+  } else {
+    for (const [, rec] of parts) {
+      for (const m of rec.mats) {
+        const mat = m.mat;
+        if (mat.__xop == null) continue;
+        mat.opacity = mat.__xop; mat.transparent = mat.__xtr; mat.depthWrite = mat.__xdw;
+        mat.__xop = null; mat.needsUpdate = true;
+      }
+    }
+    renderer.shadowMap.needsUpdate = true;
+    toast('X 光透视已关闭');
+  }
+  syncModeStat();
+}
+
+/* ================= 剖切视图 ================= */
+const CLIP_OFF = 70;
+function applyClip() {
+  const on = state.clip && state.clipPos < CLIP_OFF;
+  clipPlane.constant = state.clipPos;
+  for (const [, rec] of parts) {
+    for (const m of rec.mats) {
+      const mat = m.mat;
+      const has = mat.clippingPlanes && mat.clippingPlanes.length > 0;
+      if (on && !has) {
+        // 剖切后原本朝向相机的背面会变成「空洞」，
+        // 临时改为双面渲染，让缸孔/水套内壁显形（仅剖切期间，避免常态关闭剔除）
+        mat.__side = mat.side;
+        mat.side = THREE.DoubleSide;
+        mat.clippingPlanes = [clipPlane];
+        mat.needsUpdate = true;
+      } else if (!on && has) {
+        if (mat.__side != null) { mat.side = mat.__side; mat.__side = null; }
+        mat.clippingPlanes = null;
+        mat.needsUpdate = true;
+      }
+    }
+  }
+  trails.material.clippingPlanes = on ? [clipPlane] : null;
+}
+
+function setClip(on) {
+  state.clip = on;
+  if (on && state.clipPos >= CLIP_OFF) {
+    state.clipPos = 0;
+    $('#clip-slider').value = 0;
+  }
+  if (!on) {
+    state.clipPos = CLIP_OFF;
+    $('#clip-slider').value = CLIP_OFF;
+  }
+  $('#clip-val').textContent = on ? state.clipPos + ' cm' : '关';
+  const btn = $('#btn-clip');
+  if (btn) { btn.classList.toggle('active', on); btn.textContent = on ? '剖切 · 开' : '剖切'; }
+  applyClip();
+  renderer.shadowMap.needsUpdate = true;
+  toast(on ? '剖切视图已开启，拖动「剖切位置」滑块查看截面' : '剖切视图已关闭');
+  syncModeStat();
+}
+
+/* ================= 轨迹引导线 ================= */
+function setTrails(on) {
+  state.trails = on;
+  trails.material.opacity = 0.34;
+  const btn = $('#btn-trails');
+  if (btn) btn.classList.toggle('active', on);
+  toast(on ? '拆解轨迹引导线已开启' : '拆解轨迹引导线已关闭');
+}
+
+/* ================= 部件隐藏 ================= */
+function toggleHide(id) {
+  if (!id) { toast('请先在模型中点选一个部件'); return; }
+  const rec = parts.get(id);
+  if (!rec) return;
+  const nowHidden = !state.hidden.has(id);
+  if (nowHidden) state.hidden.add(id); else state.hidden.delete(id);
+  rec.group.visible = !nowHidden;
+  refreshXray();
+  renderer.shadowMap.needsUpdate = true;
+  $$('.cat-item').forEach(el => el.classList.toggle('hidden', state.hidden.has(el.dataset.id)));
+  toast(nowHidden ? '已隐藏「' + PART_MAP[id].name + '」（Shift+H 恢复全部）' : '已恢复显示「' + PART_MAP[id].name + '」');
+  syncModeStat();
+}
+
+function showAllHidden() {
+  if (!state.hidden.size) { toast('当前没有被隐藏的部件'); return; }
+  for (const id of state.hidden) { const r = parts.get(id); if (r) r.group.visible = true; }
+  state.hidden.clear();
+  $$('.cat-item').forEach(el => el.classList.remove('hidden'));
+  renderer.shadowMap.needsUpdate = true;
+  toast('已恢复显示全部部件');
+  syncModeStat();
+}
+
+/* ================= 截图导出 =================
+   WebGL 默认不保留绘制缓冲，因此只在「刚渲染完的同一帧」内取像素，
+   不改变 preserveDrawingBuffer（那会拖慢每一帧）。 */
+let shotPending = false;
+function takeShot() {
+  shotPending = true;
+  toast('正在导出当前视图…');
+}
+function doShot() {
+  canvas.toBlob(blob => {
+    if (!blob) { toast('截图失败，请重试'); return; }
+    const d = new Date();
+    const p = n => String(n).padStart(2, '0');
+    const name = `EA839_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.png`;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    toast('已导出 ' + name);
+  }, 'image/png');
+}
+
+/* ================= 自动导览 ================= */
+const TOUR = ['block', 'pistons', 'crank', 'headL', 'camsL', 'valves', 'timingchain',
+  'turboL', 'intake', 'exhaustL', 'oilpump', 'injectors'].filter(id => parts.has(id));
+const TOUR_HOLD = 3.4;   // 每个部件停留秒数
+
+function startTour() {
+  state.tour = { i: -1, timer: TOUR_HOLD };
+  state.targetExplode = 0;
+  state.exploded.clear();
+  for (const [id, rec] of parts) rec.group.userData.wanted = 0;
+  $('#btn-explode-all').classList.remove('active');
+  $('#btn-explode-all').textContent = '全部拆解';
+  $('#explode-slider').value = 0; $('#explode-val').textContent = '0%';
+  $('#btn-tour').classList.add('active');
+  $('#btn-tour').textContent = '停止导览';
+  toast('自动导览开始：' + TOUR.length + ' 个关键部件依次拆解');
+}
+
+function stopTour() {
+  state.tour = null;
+  $('#btn-tour').classList.remove('active');
+  $('#btn-tour').textContent = '导览';
+  toast('自动导览已停止');
+}
+
+function stepTour(dt) {
+  const t = state.tour;
+  t.timer += dt;
+  if (t.timer < TOUR_HOLD) return;
+  t.timer = 0;
+  if (t.i >= 0 && t.i < TOUR.length) {
+    const prev = TOUR[t.i];
+    if (state.exploded.has(prev)) toggleExplode(prev);
+  }
+  t.i++;
+  if (t.i >= TOUR.length) { stopTour(); toast('自动导览结束'); return; }
+  const id = TOUR[t.i];
+  selectPart(id);
+  if (!state.exploded.has(id)) toggleExplode(id);
+  focusPart(id);
+}
+
+/* ================= 顶栏模式指示 ================= */
+function syncModeStat() {
+  const tags = [];
+  if (state.xray) tags.push('X光');
+  if (state.clip) tags.push('剖切');
+  if (state.hidden.size) tags.push('隐藏 ' + state.hidden.size);
+  if (state.trails) tags.push('轨迹');
+  const el = $('#stat-mode');
+  if (el) el.textContent = '视图：' + (tags.length ? tags.join(' · ') : '透视');
+}
+
 /* ================= 控制台按钮 ================= */
 function bindBtn(sel, fn) {
   const el = $(sel);
@@ -516,7 +827,7 @@ bindBtn('#btn-reset', () => {
   camAnim = {
     t: 0, dur: 0.9,
     fromT: controls.target.clone(), toT: new THREE.Vector3(0, 6, 0),
-    fromP: camera.position.clone(), toP: new THREE.Vector3(104, 70, 74),
+    fromP: camera.position.clone(), toP: FIT_BASE.clone().multiplyScalar(fitK),
   };
   toast('视角与拆解状态已复位');
 });
@@ -562,6 +873,35 @@ bindBtn('#btn-help', () => {
   $('#btn-help').classList.toggle('active', g.style.display !== 'none');
 });
 
+/* --- 新增功能按钮 --- */
+$$('[data-view]').forEach(el => {
+  el.addEventListener('click', () => applyView(+el.dataset.view));
+});
+
+bindBtn('#btn-xray', () => setXray(!state.xray));
+bindBtn('#btn-clip', () => setClip(!state.clip));
+bindBtn('#btn-trails', () => setTrails(!state.trails));
+bindBtn('#btn-tour', () => (state.tour ? stopTour() : startTour()));
+bindBtn('#btn-hide', () => toggleHide(state.selected || state.hover));
+bindBtn('#btn-shot', takeShot);
+bindBtn('#btn-intro', () => openIntro('features'));
+bindBtn('#btn-cars', () => openIntro('cars'));
+
+$('#clip-slider').addEventListener('input', e => {
+  const v = parseFloat(e.target.value);
+  state.clipPos = v;
+  const on = v < CLIP_OFF;
+  if (on !== state.clip) {
+    state.clip = on;
+    $('#btn-clip').classList.toggle('active', on);
+    $('#btn-clip').textContent = on ? '剖切 · 开' : '剖切';
+  }
+  $('#clip-val').textContent = on ? v + ' cm' : '关';
+  applyClip();
+  renderer.shadowMap.needsUpdate = true;
+  syncModeStat();
+});
+
 /* ================= 画质档位 =================
    high：辉光 + 阴影 + 粒子 + 1.5x 像素比
    low ：关闭辉光/阴影/粒子，像素比 1 —— 集显或高分屏下的主要保帧手段 */
@@ -572,6 +912,8 @@ function setQuality(q, auto) {
   bloom.enabled = !low;
   renderer.shadowMap.enabled = !low;
   particles.visible = !low;
+  // 环境反射（IBL）在集显上是明显的片元开销，流畅档位下关闭
+  scene.environment = low ? null : envTex;
   renderer.setPixelRatio(low ? 1 : Math.min(devicePixelRatio || 1, 1.5));
   renderer.shadowMap.needsUpdate = true;
   // 透射材质（玻璃）会让 three 每帧额外渲染一遍场景，流畅画质下退化为普通半透明
@@ -617,11 +959,136 @@ function toast(msg) {
   toastTimer = setTimeout(() => t.classList.remove('show'), 2000);
 }
 
+/* ================= 应用介绍浮层 ================= */
+const INTRO_SEEN = 'ea839_intro_seen';
+const INTRO_AUTO = 'ea839_intro_auto';
+
+function carCard(v) {
+  return `
+    <div class="car-card${v.hot ? ' hot' : ''}">
+      <div class="car-name">${v.name}</div>
+      <div class="car-meta"><span>${v.code}</span><i>/</i><span>${v.years}</span></div>
+      <div class="car-num">
+        <div><span class="k">POWER</span><span class="v am">${v.power}</span></div>
+        <div><span class="k">TORQUE</span><span class="v am">${v.torque}</span></div>
+        <div><span class="k">0–100</span><span class="v">${v.acc}</span></div>
+        <div><span class="k">V-MAX</span><span class="v">${v.top}</span></div>
+      </div>
+      <div class="car-note">${v.note}</div>
+    </div>`;
+}
+
+const INTRO_RENDER = {
+  features: () => `
+    <div class="sec-head">
+      <h3>功能介绍 · FEATURES</h3>
+      <p>本应用以保时捷 / 大众集团 EA839 4.0 TFSI V8 为对象，构建可交互的三维拆解教学模型。
+         除基础拆解与运转演示外，新增 X 光透视、剖切视图、视角预设、部件隐藏、轨迹引导、自动导览与截图导出等能力，
+         可直接用于课堂讲解、展厅展示与技术培训。</p>
+    </div>
+    <div class="feat-grid">
+      ${FEATURES.map(f => `
+        <div class="feat-card">
+          <div class="feat-top">
+            <div class="feat-ico">${f.icon}</div>
+            <div class="feat-name">${f.title}</div>
+            <span class="feat-tag${f.tag === 'NEW' ? ' new' : ''}">${f.tag}</span>
+          </div>
+          <div class="feat-desc">${f.desc}</div>
+        </div>`).join('')}
+    </div>`,
+
+  cars: () => `
+    <div class="car-sec">
+      <div class="sec-head">
+        <h3>${VEHICLES.porsche.title}</h3>
+        <p>${VEHICLES.porsche.sub}</p>
+      </div>
+      <div class="car-grid">${VEHICLES.porsche.list.map(carCard).join('')}</div>
+    </div>
+    <div class="car-sec">
+      <div class="sec-head">
+        <h3>${VEHICLES.family.title}</h3>
+        <p>${VEHICLES.family.sub} —— 同一 90° V8 hot-V 基础架构，依据品牌定位进行增压压力、冷却与传动匹配差异化标定。</p>
+      </div>
+      <div class="car-grid">${VEHICLES.family.list.map(carCard).join('')}</div>
+    </div>`,
+
+  spec: () => `
+    <div class="sec-head">
+      <h3>整机技术规格 · SPECIFICATIONS</h3>
+      <p>下表为本页面展示车型（Cayenne Turbo / Panamera Turbo，550 PS 版本）的整机参数。</p>
+    </div>
+    <div class="spec-grid">
+      ${SPECS.map(([k, v]) => `<div class="row"><span>${k}</span><b>${v}</b></div>`).join('')}
+    </div>
+    <div class="sec-head" style="margin-top:24px">
+      <h3>结构亮点 · ENGINEERING HIGHLIGHTS</h3>
+      <p>在模型中可对应到具体部件，点击部件即可查看该结构的图文说明。</p>
+    </div>
+    <div class="hl-list">
+      <div><b>hot-V 布置</b><span>双涡轮置于两列气缸夹角内侧，缩短排气路径、减小涡轮迟滞，同时收窄整机宽度 —— 对应「进气增压」分组。</span></div>
+      <div><b>无缸套 PLS 涂层</b><span>缸孔采用等离子喷涂铁基涂层取代铸铁缸套，减重约 6.7 kg 并改善导热 —— 对应「铝合金缸体」。</span></div>
+      <div><b>干式油底壳</b><span>降低发动机高度与整车重心，满足高性能车型极限横向加速度下的供油需求 —— 对应「油底壳与集油盘」。</span></div>
+      <div><b>COD 闭缸</b><span>低负荷工况关闭 2/3/5/8 缸，配合 48V 系统降低巡航油耗 —— 对应「气门与弹簧组件」与凸轮轴相位。</span></div>
+      <div><b>350 bar 双喷射</b><span>缸内直喷 + 进气道喷射两套系统，兼顾高负荷功率输出与低负荷颗粒物排放 —— 对应「燃油喷油器」。</span></div>
+    </div>`,
+
+  keys: () => `
+    <div class="sec-head">
+      <h3>操作方式与快捷键 · SHORTCUTS</h3>
+      <p>鼠标与键盘均可完成全部操作；输入框聚焦时快捷键自动失效，避免与搜索冲突。</p>
+    </div>
+    <div class="key-grid">
+      ${KEYS.map(([k, v]) => `<div class="key-item"><span class="k">${k}</span><span>${v}</span></div>`).join('')}
+    </div>`,
+};
+
+let introTab = 'features';
+function renderIntro() {
+  $('#intro-body').innerHTML = INTRO_RENDER[introTab]();
+  $('#intro-body').scrollTop = 0;
+  $$('.itab').forEach(el => el.classList.toggle('active', el.dataset.tab === introTab));
+}
+function openIntro(tab) {
+  introTab = tab || introTab;
+  renderIntro();
+  $('#intro').classList.remove('hidden');
+}
+function closeIntro() {
+  $('#intro').classList.add('hidden');
+  try { localStorage.setItem(INTRO_SEEN, '1'); } catch (_) { /* 隐私模式忽略 */ }
+}
+
+$$('.itab').forEach(el => el.addEventListener('click', () => { introTab = el.dataset.tab; renderIntro(); }));
+$('#intro-close').addEventListener('click', closeIntro);
+$('#intro-mask').addEventListener('click', closeIntro);
+$('#intro-auto').addEventListener('change', e => {
+  try { localStorage.setItem(INTRO_AUTO, e.target.checked ? '1' : '0'); } catch (_) { }
+});
+
 /* ================= 键盘 ================= */
 addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  // ESC 优先关闭浮层；输入框内也生效，方便随时退出
+  if (k === 'escape') {
+    if (!$('#intro').classList.contains('hidden')) closeIntro();
+    else selectPart(null);
+    return;
+  }
   if (e.target.tagName === 'INPUT') return;
-  switch (e.key.toLowerCase()) {
-    case 'escape': selectPart(null); break;
+  switch (k) {
+    case '1': applyView(0); break;
+    case '2': applyView(1); break;
+    case '3': applyView(2); break;
+    case '4': applyView(3); break;
+    case 'x': setXray(!state.xray); break;
+    case 'c': setClip(!state.clip); break;
+    case 'g': setTrails(!state.trails); break;
+    case 'h': e.shiftKey ? showAllHidden() : toggleHide(state.selected || state.hover); break;
+    case 't': state.tour ? stopTour() : startTour(); break;
+    case 'p': takeShot(); break;
+    case 'i': $('#intro').classList.contains('hidden') ? openIntro(introTab) : closeIntro(); break;
     case 'e': $('#btn-explode-all').click(); break;
     case 'r': $('#btn-reset').click(); break;
     case 'space': e.preventDefault(); $('#btn-run').click(); break;
@@ -700,15 +1167,16 @@ function tick() {
     rec.group.userData.amount = amount;
   }
 
-  // 拆解展开时相机自动后撤，保证全部部件留在视口内
+  // 拆解展开时相机自动后撤，保证全部部件留在视口内。
+  // 只在「拆解动画进行中」触发：否则会在用户手动切换视角预设后立刻把相机拽回去。
+  let soloMax = 0;
+  for (const id of state.exploded) soloMax = Math.max(soloMax, partState.get(id)?.solo || 0);
+  const spread = Math.max(state.master, soloMax);
   {
-    let soloMax = 0;
-    for (const id of state.exploded) soloMax = Math.max(soloMax, partState.get(id)?.solo || 0);
-    const spread = Math.max(state.master, soloMax);
-    const wantDist = 118 + spread * 150;
+    const wantDist = baseDist * (1 + spread * 0.92);
     const wantTargetY = 6 + spread * 6;
     const curDist = camera.position.distanceTo(controls.target);
-    if (!camAnim && (Math.abs(curDist - wantDist) > 6 || Math.abs(controls.target.y - wantTargetY) > 2)) {
+    if (moving && !camAnim && (Math.abs(curDist - wantDist) > 6 || Math.abs(controls.target.y - wantTargetY) > 2)) {
       _v1.subVectors(camera.position, controls.target).normalize();
       camAnim = {
         t: 0, dur: 0.7,
@@ -767,8 +1235,19 @@ function tick() {
   }
 
   controls.update();
+
+  // 自动导览：按装配顺序依次聚焦并拆解关键部件
+  if (state.tour) stepTour(dt);
+
+  // 轨迹引导线：开启即显示，透明度随拆解程度增强
+  trails.visible = state.trails;
+  if (state.trails) trails.material.opacity = 0.12 + Math.min(1, spread * 1.6) * 0.34;
+
   updateLabels();
   composer.render();
+
+  // 截图必须紧跟渲染：WebGL 不保留绘制缓冲
+  if (shotPending) { shotPending = false; doShot(); }
 }
 
 /* ================= 启动 ================= */
@@ -777,12 +1256,27 @@ showDetail(null);
 ensureLabels();
 onResize();                                   // 统一后处理缓冲尺寸
 $('#btn-labels').classList.toggle('active', state.labelMode !== 0);
+$$('[data-view]')[0]?.classList.add('active');
+syncModeStat();
 tick();
 
 setTimeout(() => {
   $('#loader').classList.add('hide');
-  toast('点击模型任意部件开始交互式拆解');
+  toast('点击模型任意部件开始交互式拆解 · 按 I 查看应用介绍');
 }, 420);
+
+// 首次访问自动打开应用介绍（可在浮层底部关闭）
+// 地址栏 #intro=0 直接跳过，#intro=cars|spec|keys 可直达指定标签页
+try {
+  const m = /intro=([\w]+)/.exec(location.hash);
+  const want = m ? m[1] : null;
+  const auto = localStorage.getItem(INTRO_AUTO);
+  $('#intro-auto').checked = auto !== '0';
+  if (want && want !== '0') setTimeout(() => openIntro(INTRO_RENDER[want] ? want : 'features'), 760);
+  else if (!want && !localStorage.getItem(INTRO_SEEN) && auto !== '0') {
+    setTimeout(() => openIntro('features'), 760);
+  }
+} catch (_) { /* 隐私模式下跳过 */ }
 
 
 // 支持 #explode / #select=<id> / #run 预置视图状态
@@ -818,6 +1312,7 @@ setTimeout(() => {
     $('#rpm-val').textContent = state.rpm + ' rpm';
   }
   if (q.get('spin')) { controls.autoRotate = true; $('#btn-spin').classList.add('active'); }
+  if (q.get('q') === 'low') setQuality('low', true);
 })();
 
 window.__ea839 = { scene, camera, parts, state, renderer, controls, selectPart, toggleExplode, focusPart };

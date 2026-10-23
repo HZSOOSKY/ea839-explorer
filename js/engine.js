@@ -158,22 +158,154 @@ export function buildEngine() {
   root.name = 'EA839';
   const parts = new Map();
 
+  /**
+   * 收集需要保持独立的动画对象（曲轴、活塞、连杆、涡轮叶轮、火焰等）。
+   * 它们被 updateKinematics / updateFlames 逐帧驱动，不能参与几何合并。
+   */
+  function collectDynamic(g, set) {
+    const mark = o => { if (o && o.isObject3D) o.traverse(x => set.add(x)); };
+    g.traverse(o => {
+      const ud = o.userData;
+      if (!ud) return;
+      for (const k of Object.keys(ud)) {
+        const v = ud[k];
+        if (v && v.isObject3D) mark(v);
+        else if (Array.isArray(v)) {
+          for (const it of v) {
+            if (it && it.isObject3D) mark(it);
+            else if (it && typeof it === 'object') {
+              for (const w of Object.values(it)) mark(w);
+            }
+          }
+        }
+      }
+    });
+  }
+
+  /**
+   * 同一部件内，把「材质相同且非动画对象」的网格合并为单个网格，
+   * 变换烘焙进几何。原实现每台发动机有 770+ 个独立网格与材质实例，
+   * 合并后降到百余个，draw call 与材质切换开销大幅下降。
+   */
+  function mergeStaticMeshes(g, dynamic) {
+    g.updateMatrixWorld(true);
+    const inv = new THREE.Matrix4().copy(g.matrixWorld).invert();
+    const local = new THREE.Matrix4();
+
+    const list = [];
+    g.traverse(o => { if (o.isMesh && !dynamic.has(o)) list.push(o); });
+    if (list.length < 2) return 0;
+
+    const buckets = new Map();
+    for (const o of list) {
+      if (!o.material || !o.geometry) continue;
+      let b = buckets.get(o.material);
+      if (!b) buckets.set(o.material, b = []);
+      b.push(o);
+    }
+
+    let reduced = 0;
+    for (const [mat, objs] of buckets) {
+      if (objs.length < 2) continue;
+      const first = objs[0].geometry;
+      const keys = Object.keys(first.attributes).sort();
+      const sig = keys.join(',');
+      const hasIndex = !!first.index;
+      let ok = !!first.attributes.position;
+      for (const o of objs) {
+        const gg = o.geometry;
+        if (!gg || !gg.attributes.position) { ok = false; break; }
+        if (Object.keys(gg.attributes).sort().join(',') !== sig) { ok = false; break; }
+        if (!!gg.index !== hasIndex) { ok = false; break; }
+        for (const k of keys) {
+          if (gg.attributes[k].isInterleavedBufferAttribute) { ok = false; break; }
+        }
+        if (!ok) break;
+      }
+      if (!ok) continue;
+
+      // 逐网格克隆并把相对部件组的变换烘焙进几何（不污染可能被共享的原始几何）
+      const baked = objs.map(o => {
+        const c = o.geometry.clone();
+        local.multiplyMatrices(inv, o.matrixWorld);
+        c.applyMatrix4(local);
+        return c;
+      });
+
+      let vCount = 0, iCount = 0;
+      for (const gg of baked) {
+        vCount += gg.attributes.position.count;
+        iCount += hasIndex ? gg.index.count : 0;
+      }
+      const attrs = {};
+      for (const k of keys) attrs[k] = new Float32Array(vCount * first.attributes[k].itemSize);
+      let idxArr = null;
+      if (hasIndex) {
+        const Ctor = vCount > 65535 ? Uint32Array : Uint16Array;
+        idxArr = new Ctor(iCount);
+      }
+
+      let vo = 0, io = 0;
+      for (const gg of baked) {
+        const n = gg.attributes.position.count;
+        for (const k of keys) {
+          const src = gg.attributes[k];
+          attrs[k].set(src.array.subarray(0, n * src.itemSize), vo * src.itemSize);
+        }
+        if (hasIndex) {
+          const gi = gg.index.array;
+          for (let i = 0; i < gi.length; i++) idxArr[io + i] = gi[i] + vo;
+          io += gi.length;
+        }
+        vo += n;
+        gg.dispose();
+      }
+
+      const merged = new THREE.BufferGeometry();
+      for (const k of keys) {
+        merged.setAttribute(k, new THREE.BufferAttribute(attrs[k], first.attributes[k].itemSize));
+      }
+      if (idxArr) merged.setIndex(new THREE.BufferAttribute(idxArr, 1));
+      merged.computeBoundingSphere();
+      merged.computeBoundingBox();
+
+      for (const o of objs) if (o.parent) o.parent.remove(o);
+      const nm = new THREE.Mesh(merged, mat);
+      nm.castShadow = true; nm.receiveShadow = true;
+      g.add(nm);
+      reduced += objs.length - 1;
+    }
+    return reduced;
+  }
+
   function part(id, buildFn, opts = {}) {
     const g = new THREE.Group();
     g.name = id;
     buildFn(g);
+
+    // 1) 先识别动画对象，再把静态网格按材质合并
+    const dynamic = new Set();
+    collectDynamic(g, dynamic);
+    mergeStaticMeshes(g, dynamic);
+
     const rec = { id, group: g, home: new THREE.Vector3(), offset: new THREE.Vector3(), mats: [], ...opts };
-    // 单次遍历：克隆材质并记录原始自发光参数，供高亮还原使用
+    // 2) 同一部件内「源材质相同」的网格共享一个克隆实例：
+    //    既保留部件级高亮能力，又避免 700+ 份材质实例带来的 uniform 上传开销
+    const shared = new Map();
     g.traverse(o => {
-      if (!o.isMesh) return;
-      if (!o.material) return;
-      o.material = o.material.clone();
+      if (!o.isMesh || !o.material) return;
       o.userData.partId = id;
-      rec.mats.push({
-        mat: o.material,
-        base: o.material.emissive ? o.material.emissive.clone() : new THREE.Color(0x000000),
-        bi: o.material.emissiveIntensity,
-      });
+      let m = shared.get(o.material);
+      if (!m) {
+        m = o.material.clone();
+        shared.set(o.material, m);
+        rec.mats.push({
+          mat: m,
+          base: m.emissive ? m.emissive.clone() : new THREE.Color(0x000000),
+          bi: m.emissiveIntensity,
+        });
+      }
+      o.material = m;
     });
     root.add(g);
     parts.set(id, rec);

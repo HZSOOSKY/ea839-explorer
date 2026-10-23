@@ -64,9 +64,11 @@
     <div class="guide-row"><span class="key">点击部件</span><span>查看详情并拆解</span></div>
     <div class="guide-row"><span class="key">E / R</span><span>全部拆解 / 复位</span></div>
     <div class="guide-row"><span class="key">空格 / F / L</span><span>运转 / 聚焦 / 标注</span></div>
+    <div class="guide-row"><span class="key">Q</span><span>画质：高 / 流畅</span></div>
     <div class="guide-row"><span class="key">ESC</span><span>取消选择</span></div>
     <div class="guide-note">
-      提示：点击模型中的高亮部件会触发该部件的拆解动画，并同步展示其材料、工艺与性能参数。
+      提示：点击模型中的高亮部件会触发该部件的拆解动画，并同步展示其材料、工艺与性能参数。<br>
+      标注默认只跟随「选中 / 悬停 / 已拆解」的部件；帧率偏低时会自动切换到流畅画质，也可按 Q 手动切换。
     </div>
   </div>
 
@@ -104,7 +106,8 @@
     <div class="con-group">
       <span class="con-label">显示</span>
       <div class="btn-row">
-        <button class="btn" id="btn-labels">全部标注</button>
+        <button class="btn" id="btn-labels">标注：智能</button>
+        <button class="btn" id="btn-quality">画质：高</button>
         <button class="btn active" id="btn-help">引导</button>
       </div>
     </div>

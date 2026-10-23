@@ -345,22 +345,31 @@ input[type=range]::-moz-range-thumb {
 
 /* ---------------- 3D 标注层 ---------------- */
 #labels { position: absolute; inset: 0; pointer-events: none; z-index: 12; overflow: hidden; }
+/* 标注标签：
+   性能要点——不使用 backdrop-filter（每个标签都会生成独立的背景模糊合成层，
+   30+ 个标签同时显示会直接拖垮帧率），改用高不透明度实色底 + 轻微投影代替。
+   同时限制合成层数量，仅对 transform 做变更，避免触发布局重排。 */
 .lbl {
   position: absolute;
-  transform: translate(0, -50%);
+  top: 0; left: 0;
+  transform: translate3d(0, 0, 0);
   font-family: var(--mono); font-size: 10px; letter-spacing: 0.05em;
   color: var(--cyan);
-  background: rgba(4, 12, 18, 0.78);
+  background: rgba(6, 16, 24, 0.93);
   border: 1px solid var(--line-strong);
   border-left: 2px solid var(--cyan);
   border-radius: 2px;
   padding: 3px 8px 3px 7px;
   white-space: nowrap;
-  backdrop-filter: blur(3px);
   text-shadow: 0 0 8px rgba(72, 220, 255, 0.4);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.45);
   opacity: 0;
-  transition: opacity 0.3s;
+  pointer-events: none;
+  transition: opacity 0.18s;
+  will-change: transform;
+  contain: layout style;
 }
+.lbl.off { display: none; }
 .lbl.show { opacity: 1; }
 .lbl.sel {
   color: var(--amber); border-color: rgba(255, 182, 72, 0.6); border-left-color: var(--amber);

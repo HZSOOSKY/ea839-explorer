@@ -16,13 +16,17 @@ const $$ = s => Array.from(document.querySelectorAll(s));
 /* ================= 渲染器 / 场景 ================= */
 const canvas = $('#scene');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+// 像素比上限 1.5：2.0 在高 DPI 屏上会让片元数与后处理开销翻倍，是掉帧的主因之一
+renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 1.5));
 renderer.setSize(innerWidth, innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.18;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+// 阴影改为按需更新：方向光阴影与相机无关，只有部件移动（拆解/运转）时才需要重画
+renderer.shadowMap.autoUpdate = false;
+renderer.shadowMap.needsUpdate = true;
 
 const scene = new THREE.Scene();
 scene.fog = new THREE.FogExp2(0x040810, 0.0042);
@@ -46,7 +50,7 @@ scene.add(new THREE.HemisphereLight(0x5a8fb5, 0x0d141c, 0.95));
 const key = new THREE.DirectionalLight(0xdcf0ff, 2.9);
 key.position.set(60, 90, 70);
 key.castShadow = true;
-key.shadow.mapSize.set(2048, 2048);
+key.shadow.mapSize.set(1024, 1024);
 key.shadow.camera.near = 20;
 key.shadow.camera.far = 320;
 key.shadow.camera.left = -90; key.shadow.camera.right = 90;
@@ -131,9 +135,15 @@ for (const [id, rec] of parts) {
 }
 
 /* ================= 后期处理 ================= */
+/* Bloom 以半分辨率运行：辉光本身是低频模糊，降采样肉眼几乎无差，
+   但省下 5 级 mip 模糊链的大量填充率开销。 */
+const BLOOM_SCALE = 0.5;
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
-const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.62, 0.72, 0.82);
+const bloom = new UnrealBloomPass(
+  new THREE.Vector2(innerWidth * BLOOM_SCALE, innerHeight * BLOOM_SCALE), 0.62, 0.72, 0.82);
+const _bloomSetSize = bloom.setSize.bind(bloom);
+bloom.setSize = (w, h) => _bloomSetSize(w * BLOOM_SCALE, h * BLOOM_SCALE);
 composer.addPass(bloom);
 composer.addPass(new OutputPass());
 
@@ -147,8 +157,9 @@ const state = {
   explodeAmount: 0,      // 0 = 合拢, 1 = 全拆
   targetExplode: 0,
   exploded: new Set(),    // 单独拆出的部件
-  showLabels: true,
-  showAllLabels: false,
+  labelMode: 1,           // 0=关闭  1=智能（选中/悬停/已拆解）  2=全部
+  quality: 'high',        // high | low
+  autoQuality: true,      // 帧率过低时自动降级
   master: 0,              // 爆炸插值
   frame: 0,
   fps: 60,
@@ -323,91 +334,134 @@ canvas.addEventListener('pointerup', e => {
   if (!state.exploded.has(id)) toggleExplode(id);
 });
 
+/* 悬停拾取只记录坐标，真正的射线求交放到主循环里节流执行。
+   pointermove 每秒可触发上百次，每次对整机所有子网格做射线求交是主要卡顿源之一。 */
+let pendingPick = null;
 canvas.addEventListener('pointermove', e => {
   if (e.buttons) return;
-  const id = pickAt(e.clientX, e.clientY);
-  if (id !== state.hover) {
-    state.hover = id;
-    canvas.classList.toggle('pickable', !!id);
-    applyHighlight();
-  }
+  pendingPick = { x: e.clientX, y: e.clientY };
+});
+canvas.addEventListener('pointerleave', () => {
+  pendingPick = null;
+  if (state.hover) { state.hover = null; canvas.classList.remove('pickable'); applyHighlight(); }
 });
 
-/* ================= 标注 ================= */
+/* ================= 标注 =================
+   设计要点：
+   1) 三态开关：关闭 / 智能（仅选中·悬停·已拆解）/ 全部（限量）。
+      旧实现只要存在任一选中项就渲染全部 31 个标签，「关闭」按钮也无法真正隐藏。
+   2) 无论哪种模式都限制同屏标签数量，避免堆叠与 DOM 写入风暴。
+   3) 只在数值变化时写 DOM（缓存上一次 transform / opacity / class），
+      并统一走 translate3d 走合成层，不触发布局重排。 */
 const labelEls = new Map();
 const labelLayer = $('#labels');
-const leaderSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-leaderSvg.setAttribute('id', 'leaders');
-leaderSvg.style.width = '100%';
-leaderSvg.style.height = '100%';
-labelLayer.appendChild(leaderSvg);
+
+const LABEL_MODES = [
+  { key: 'off', text: '标注：关', limit: 0 },
+  { key: 'smart', text: '标注：智能', limit: 10 },
+  { key: 'all', text: '标注：全部', limit: 16 },
+];
 
 function ensureLabels() {
-  for (const [id, rec] of parts) {
+  const order = new Map(PARTS.map((p, i) => [p.id, i + 1]));
+  for (const [id] of parts) {
     if (labelEls.has(id)) continue;
     const el = document.createElement('div');
     el.className = 'lbl';
-    el.innerHTML = `<span class="idx">${String(PARTS.findIndex(p => p.id === id) + 1).padStart(2, '0')}</span><span class="tx"></span>`;
+    el.innerHTML = `<span class="idx">${String(order.get(id) || 0).padStart(2, '0')}</span><span class="tx"></span>`;
     el.querySelector('.tx').textContent = PART_MAP[id] ? PART_MAP[id].name : id;
+    el._shown = false;
+    el._tf = '';
+    el._op = '';
+    el._sel = null;
     labelLayer.appendChild(el);
     labelEls.set(id, el);
   }
 }
 
-const _wp = new THREE.Vector3();
-function updateLabels() {
-  ensureLabels();
-  const camDir = camera.getWorldDirection(new THREE.Vector3());
-  const show = state.showLabels && (state.showAllLabels || state.selected || state.exploded.size || state.master > 0.05);
+function hideLabel(el) {
+  if (!el) return;
+  if (el._shown) { el.classList.remove('show'); el._shown = false; }
+  // 必须同时把内联 opacity 归零：内联样式优先级高于 .lbl{opacity:0}，
+  // 只移除 class 的话标签会一直留在屏幕上（旧版「标注关不掉」的另一半原因）
+  if (el._op !== '0') { el.style.opacity = '0'; el._op = '0'; }
+}
 
-  // 收集可见标签的屏幕坐标，随后做垂直避让与左右分侧排布
-  const items = [];
+const _wp = new THREE.Vector3();
+const _tmpItems = [];
+
+function updateLabels() {
+  if (!labelEls.size) ensureLabels();
+  const mode = LABEL_MODES[state.labelMode];
+  const limit = state.quality === 'low' ? Math.min(8, mode.limit) : mode.limit;
+
+  // 关闭模式：一次性全部隐藏后直接返回，之后每帧零 DOM 操作
+  if (mode.key === 'off' || limit === 0) {
+    for (const el of labelEls.values()) hideLabel(el);
+    return;
+  }
+
+  // 1) 收集候选：智能模式只取「选中 / 悬停 / 已拆解」的部件；
+  //    整机拆解展开时（滑块 > 5%）改为限量显示全部，否则拆解视图里会一个标注都没有
+  const globalExplode = state.master > 0.05;
+  _tmpItems.length = 0;
   for (const [id, rec] of parts) {
     const el = labelEls.get(id);
     if (!el) continue;
+    if (mode.key === 'smart' && !globalExplode) {
+      const focused = id === state.selected || id === state.hover || state.exploded.has(id);
+      if (!focused) { hideLabel(el); continue; }
+    }
     const anchor = rec.group.userData.labelWorld;
-    if (!anchor) { el.classList.remove('show'); continue; }
+    if (!anchor) { hideLabel(el); continue; }
     _wp.copy(anchor);
     const dist = _wp.distanceTo(camera.position);
     _wp.project(camera);
-    const visible = _wp.z < 1 && Math.abs(_wp.x) < 1.25 && Math.abs(_wp.y) < 1.2;
-    if (!visible || !show) { el.classList.remove('show'); continue; }
-    items.push({
-      id, el, dist,
+    if (!(_wp.z < 1 && Math.abs(_wp.x) < 1.25 && Math.abs(_wp.y) < 1.2)) { hideLabel(el); continue; }
+    const isSel = state.selected === id || state.hover === id || state.exploded.has(id);
+    _tmpItems.push({
+      el, dist, isSel,
       x: (_wp.x * 0.5 + 0.5) * innerWidth,
       y: (-_wp.y * 0.5 + 0.5) * innerHeight,
-      isSel: state.selected === id,
     });
   }
 
-  // 选中项优先占据其位置，其余按屏幕 Y 排序后分左右两列避让
-  items.sort((a, b) => (b.isSel - a.isSel) || (a.y - b.y));
-  const LH = 20;                       // 标签最小行高
-  const leftCol = [], rightCol = [];
-  const midX = innerWidth * 0.5;
-  for (const it of items) {
-    const col = it.x < midX ? leftCol : rightCol;
-    // 在本列中找到不与已放置标签冲突的 Y
-    let y = it.y;
-    let guard = 0;
-    while (guard++ < 40 && col.some(c => Math.abs(c - y) < LH)) {
-      y += LH;
-      if (y > innerHeight - 70) { y = it.y - LH * col.length; break; }
-    }
-    col.push(y);
-    it.ly = y;
-    it.side = it.x < midX ? -1 : 1;
+  // 2) 全部模式下限量：优先保留选中/悬停/已拆解，其余按距离由近及远
+  if (_tmpItems.length > limit) {
+    _tmpItems.sort((a, b) => (b.isSel - a.isSel) || (a.dist - b.dist));
+    for (let i = limit; i < _tmpItems.length; i++) hideLabel(_tmpItems[i].el);
+    _tmpItems.length = limit;
   }
 
-  for (const it of items) {
+  // 3) 垂直避让：按屏幕 Y 排序，保证相邻标签至少间隔一个行高
+  _tmpItems.sort((a, b) => (b.isSel - a.isSel) || (a.y - b.y));
+  const LH = 20;
+  const placed = [];
+  const maxY = innerHeight - 70;
+  for (const it of _tmpItems) {
+    let y = it.y;
+    let guard = 0;
+    while (guard++ < 24 && placed.some(p => Math.abs(p - y) < LH)) {
+      y += LH;
+      if (y > maxY) { y = Math.max(70, it.y - LH * placed.length); break; }
+    }
+    placed.push(y);
+    it.ly = y;
+    it.side = it.x < innerWidth * 0.5 ? -1 : 1;
+  }
+
+  // 4) 写入：仅当值变化时才碰 DOM
+  for (const it of _tmpItems) {
     const el = it.el;
     const off = it.side < 0 ? -14 : 14;
-    // 标签位于锚点外侧，文字对齐方向随左右翻转
-    el.style.transform = `translate(${it.x + off}px, ${it.ly}px) translateY(-50%)${it.side < 0 ? ' translateX(-100%)' : ''}`;
-    el.style.textAlign = it.side < 0 ? 'right' : 'left';
-    el.classList.add('show');
-    el.classList.toggle('sel', it.isSel);
-    el.style.opacity = it.isSel ? '1' : String(Math.max(0.28, Math.min(1, 130 / it.dist)));
+    const tx = it.x + off;
+    const tf = `translate3d(${tx.toFixed(1)}px, ${it.ly.toFixed(1)}px, 0)`
+      + (it.side < 0 ? ' translate(-100%, -50%)' : ' translate(0, -50%)');
+    if (el._tf !== tf) { el.style.transform = tf; el._tf = tf; }
+    const op = it.isSel ? '1' : Math.max(0.34, Math.min(1, 130 / it.dist)).toFixed(2);
+    if (el._op !== op) { el.style.opacity = op; el._op = op; }
+    if (el._sel !== it.isSel) { el.classList.toggle('sel', it.isSel); el._sel = it.isSel; }
+    if (!el._shown) { el.classList.add('show'); el._shown = true; }
   }
 }
 
@@ -469,6 +523,7 @@ bindBtn('#btn-reset', () => {
 
 bindBtn('#btn-run', () => {
   state.running = !state.running;
+  kinDirty = true;                 // 停机时也要再算一次，把火焰强度归零
   $('#btn-run').classList.toggle('active', state.running);
   $('#btn-run').textContent = state.running ? '停止运转' : '运转演示';
   toast(state.running ? '曲柄连杆运动演示启动' : '运转演示已停止');
@@ -481,9 +536,19 @@ bindBtn('#btn-spin', () => {
 });
 
 bindBtn('#btn-labels', () => {
-  state.showAllLabels = !state.showAllLabels;
-  $('#btn-labels').classList.toggle('active', state.showAllLabels);
-  toast(state.showAllLabels ? '显示全部部件标注' : '仅显示选中/拆解部件标注');
+  state.labelMode = (state.labelMode + 1) % LABEL_MODES.length;
+  const m = LABEL_MODES[state.labelMode];
+  const btn = $('#btn-labels');
+  btn.textContent = m.text;
+  btn.classList.toggle('active', state.labelMode !== 0);
+  toast(state.labelMode === 0 ? '已关闭全部标注'
+    : state.labelMode === 1 ? '标注模式：智能（仅选中 / 悬停 / 已拆解部件）'
+      : '标注模式：全部（同屏最多 ' + m.limit + ' 个）');
+  updateLabels();
+});
+
+bindBtn('#btn-quality', () => {
+  setQuality(state.quality === 'high' ? 'low' : 'high', false);
 });
 
 bindBtn('#btn-focus', () => {
@@ -496,6 +561,36 @@ bindBtn('#btn-help', () => {
   g.style.display = g.style.display === 'none' ? '' : 'none';
   $('#btn-help').classList.toggle('active', g.style.display !== 'none');
 });
+
+/* ================= 画质档位 =================
+   high：辉光 + 阴影 + 粒子 + 1.5x 像素比
+   low ：关闭辉光/阴影/粒子，像素比 1 —— 集显或高分屏下的主要保帧手段 */
+function setQuality(q, auto) {
+  state.quality = q;
+  if (!auto) state.autoQuality = false;
+  const low = q === 'low';
+  bloom.enabled = !low;
+  renderer.shadowMap.enabled = !low;
+  particles.visible = !low;
+  renderer.setPixelRatio(low ? 1 : Math.min(devicePixelRatio || 1, 1.5));
+  renderer.shadowMap.needsUpdate = true;
+  // 透射材质（玻璃）会让 three 每帧额外渲染一遍场景，流畅画质下退化为普通半透明
+  for (const [, rec] of parts) {
+    for (const m of rec.mats) {
+      const mat = m.mat;
+      if (!mat.transmission) continue;
+      if (low) { mat.__trans = mat.transmission; mat.transmission = 0; mat.needsUpdate = true; }
+      else if (mat.__trans != null) { mat.transmission = mat.__trans; mat.needsUpdate = true; }
+    }
+  }
+  onResize();
+  const btn = $('#btn-quality');
+  if (btn) {
+    btn.textContent = low ? '画质：流畅' : '画质：高';
+    btn.classList.toggle('active', low);
+  }
+  if (!auto) toast(low ? '已切换到流畅画质（关闭辉光 / 阴影 / 粒子）' : '已切换到高画质');
+}
 
 /* 拆解滑块 */
 $('#explode-slider').addEventListener('input', e => {
@@ -532,42 +627,74 @@ addEventListener('keydown', e => {
     case 'space': e.preventDefault(); $('#btn-run').click(); break;
     case 'f': $('#btn-focus').click(); break;
     case 'l': $('#btn-labels').click(); break;
+    case 'q': $('#btn-quality').click(); break;
   }
 });
 
 /* ================= 尺寸自适应 ================= */
 function onResize() {
-  camera.aspect = innerWidth / innerHeight;
+  const w = innerWidth, h = innerHeight;
+  camera.aspect = w / h;
   camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth, innerHeight);
-  composer.setSize(innerWidth, innerHeight);
-  bloom.setSize(innerWidth, innerHeight);
+  renderer.setSize(w, h);
+  // 后处理的 RT 必须按「绘制缓冲」尺寸（含像素比）设置，
+  // 传 CSS 尺寸会让画面被降采样而发虚
+  const pr = renderer.getPixelRatio();
+  composer.setSize(w * pr, h * pr);
 }
 addEventListener('resize', onResize);
 
 /* ================= 动画循环 ================= */
 const clock = new THREE.Clock();
-let fpsAcc = 0, fpsCount = 0;
+let fpsAcc = 0, fpsCount = 0, lowStreak = 0, lastPickAt = 0;
+let kinDirty = true;                       // 运动学/火焰只在运转或状态变化时重算
+let anchorsReady = false;                  // 标注锚点世界坐标是否已算过
+const _v1 = new THREE.Vector3();
 
 function tick() {
   requestAnimationFrame(tick);
   const dt = Math.min(0.05, clock.getDelta());
   state.frame++;
 
-  // FPS
+  // FPS 统计 + 帧率过低时自动降级
   fpsAcc += dt; fpsCount++;
   if (fpsAcc > 0.5) {
     state.fps = Math.round(fpsCount / fpsAcc);
     $('#fps').textContent = state.fps;
     fpsAcc = 0; fpsCount = 0;
+    if (state.autoQuality && state.quality === 'high' && state.fps < 34) {
+      if (++lowStreak >= 3) {
+        lowStreak = 0;
+        setQuality('low', true);
+        toast('检测到帧率偏低，已自动切换到流畅画质（可按 Q 切回）');
+      }
+    } else {
+      lowStreak = 0;
+    }
+  }
+
+  // 悬停拾取：节流到约 11 次/秒
+  if (pendingPick && performance.now() - lastPickAt > 90) {
+    lastPickAt = performance.now();
+    const id = pickAt(pendingPick.x, pendingPick.y);
+    pendingPick = null;
+    if (id !== state.hover) {
+      state.hover = id;
+      canvas.classList.toggle('pickable', !!id);
+      applyHighlight();
+    }
   }
 
   // 拆解插值
-  state.master += (state.targetExplode - state.master) * Math.min(1, dt * 4.2);
+  let moving = false;
+  const mStep = Math.min(1, dt * 4.2), sStep = Math.min(1, dt * 5.0);
+  if (Math.abs(state.targetExplode - state.master) > 0.002) moving = true;
+  state.master += (state.targetExplode - state.master) * mStep;
   for (const [id, rec] of parts) {
     const ps = partState.get(id);
     const soloTarget = state.exploded.has(id) ? 1 : 0;
-    ps.solo += (soloTarget - ps.solo) * Math.min(1, dt * 5.0);
+    if (Math.abs(soloTarget - ps.solo) > 0.002) moving = true;
+    ps.solo += (soloTarget - ps.solo) * sStep;
     const amount = Math.max(state.master, ps.solo);
     rec.group.position.copy(rec.offset).multiplyScalar(amount);
     rec.group.userData.amount = amount;
@@ -582,23 +709,30 @@ function tick() {
     const wantTargetY = 6 + spread * 6;
     const curDist = camera.position.distanceTo(controls.target);
     if (!camAnim && (Math.abs(curDist - wantDist) > 6 || Math.abs(controls.target.y - wantTargetY) > 2)) {
-      const dir = new THREE.Vector3().subVectors(camera.position, controls.target).normalize();
+      _v1.subVectors(camera.position, controls.target).normalize();
       camAnim = {
         t: 0, dur: 0.7,
         fromT: controls.target.clone(), toT: new THREE.Vector3(0, wantTargetY, 0),
         fromP: camera.position.clone(),
-        toP: new THREE.Vector3(0, wantTargetY, 0).add(dir.multiplyScalar(wantDist)),
+        toP: new THREE.Vector3(0, wantTargetY, 0).add(_v1.multiplyScalar(wantDist)),
       };
     }
   }
 
-  // 运动学
+  // 运动学：静止时完全跳过（旧实现即使停机也每帧重算 8 缸曲柄连杆）
   if (state.running) {
     state.crankAngle += (state.rpm / 60) * Math.PI * 2 * dt;
     if (state.crankAngle > Math.PI * 2) state.crankAngle -= Math.PI * 2;
+    kinDirty = true;
   }
-  updateKinematics(state.crankAngle);
-  updateFlames(state.crankAngle, state.running);
+  if (kinDirty) {
+    updateKinematics(state.crankAngle);
+    updateFlames(state.crankAngle, state.running);
+    kinDirty = state.running;
+  }
+
+  // 阴影只在有物体移动时重画（静态时省掉一遍阴影贴图渲染）
+  if (moving || state.running) renderer.shadowMap.needsUpdate = true;
 
   // 相机动画
   if (camAnim) {
@@ -621,12 +755,15 @@ function tick() {
   glowRing.rotation.z = -state.frame * 0.0009;
   particles.rotation.y = state.frame * 0.00035;
 
-  // 标注锚点随拆解移动（锚点为部件组局部坐标，随组位移自动跟随）
-  for (const [id, rec] of parts) {
-    if (!rec.label) continue;
-    if (!rec.group.userData.labelWorld) rec.group.userData.labelWorld = new THREE.Vector3();
-    if (!rec.group.userData.labelLocal) rec.group.userData.labelLocal = new THREE.Vector3(...rec.label);
-    rec.group.localToWorld(rec.group.userData.labelWorld.copy(rec.group.userData.labelLocal));
+  // 标注锚点的世界坐标只随部件移动变化（与相机无关），故仅在拆解/运转时重算
+  if (moving || !anchorsReady) {
+    for (const [id, rec] of parts) {
+      if (!rec.label) continue;
+      if (!rec.group.userData.labelWorld) rec.group.userData.labelWorld = new THREE.Vector3();
+      if (!rec.group.userData.labelLocal) rec.group.userData.labelLocal = new THREE.Vector3(...rec.label);
+      rec.group.localToWorld(rec.group.userData.labelWorld.copy(rec.group.userData.labelLocal));
+    }
+    anchorsReady = true;
   }
 
   controls.update();
@@ -638,6 +775,8 @@ function tick() {
 buildCatalog();
 showDetail(null);
 ensureLabels();
+onResize();                                   // 统一后处理缓冲尺寸
+$('#btn-labels').classList.toggle('active', state.labelMode !== 0);
 tick();
 
 setTimeout(() => {

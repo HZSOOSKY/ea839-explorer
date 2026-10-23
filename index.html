@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>保时捷 EA839 4.0 V8 · 交互式拆解可视化</title>
+<link rel="stylesheet" href="./css/style.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "three/addons/": "./vendor/addons/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app">
+  <canvas id="scene"></canvas>
+  <div id="labels"></div>
+
+  <!-- 顶栏 -->
+  <header id="topbar">
+    <div class="brand">
+      <h1>保时捷 <span class="accent">EA839</span> 4.0 V8</h1>
+      <span class="sub">Interactive Teardown Visualization</span>
+    </div>
+    <div class="spacer"></div>
+    <div class="tb-stat"><span class="dot"></span>系统就绪</div>
+    <div class="tb-stat">FPS <b id="fps">60</b></div>
+    <div class="tb-stat">3996 cc · 90° V8 · 32V</div>
+    <div class="tb-stat">550 PS / 770 Nm</div>
+  </header>
+
+  <!-- 左侧：组件清单 -->
+  <aside class="panel" id="catalog">
+    <div class="panel-head">
+      <h2>组件清单</h2>
+      <span class="en">BOM</span>
+      <span class="spacer"></span>
+      <span class="en" id="bom-count">31</span>
+    </div>
+    <div id="search-wrap">
+      <input id="search" type="text" placeholder="搜索部件名称 / 英文名…" autocomplete="off">
+    </div>
+    <div id="catalog-list"></div>
+  </aside>
+
+  <!-- 右侧：部件详情 -->
+  <aside class="panel" id="detail">
+    <div class="panel-head">
+      <h2>部件详情</h2>
+      <span class="en">Component Details</span>
+    </div>
+    <div id="detail-body"></div>
+  </aside>
+
+  <!-- 左下：操作引导 -->
+  <div id="guide">
+    <h3>操作引导 <span class="en">GUIDE</span></h3>
+    <div class="guide-row"><span class="key">拖拽</span><span>旋转视角</span></div>
+    <div class="guide-row"><span class="key">滚轮</span><span>缩放模型</span></div>
+    <div class="guide-row"><span class="key">右键拖拽</span><span>平移视图</span></div>
+    <div class="guide-row"><span class="key">点击部件</span><span>查看详情并拆解</span></div>
+    <div class="guide-row"><span class="key">E / R</span><span>全部拆解 / 复位</span></div>
+    <div class="guide-row"><span class="key">空格 / F / L</span><span>运转 / 聚焦 / 标注</span></div>
+    <div class="guide-row"><span class="key">ESC</span><span>取消选择</span></div>
+    <div class="guide-note">
+      提示：点击模型中的高亮部件会触发该部件的拆解动画，并同步展示其材料、工艺与性能参数。
+    </div>
+  </div>
+
+  <!-- 底部控制台 -->
+  <div id="console">
+    <div class="con-group">
+      <span class="con-label">拆解视图</span>
+      <div class="btn-row">
+        <button class="btn amber" id="btn-explode-all">全部拆解</button>
+        <button class="btn" id="btn-reset">复位</button>
+        <button class="btn" id="btn-focus">聚焦</button>
+      </div>
+    </div>
+    <div class="con-group">
+      <span class="con-label">拆解程度</span>
+      <div class="slider-row">
+        <input type="range" id="explode-slider" min="0" max="1" step="0.01" value="0">
+        <span class="slider-val" id="explode-val">0%</span>
+      </div>
+    </div>
+    <div class="con-group">
+      <span class="con-label">演示模式</span>
+      <div class="btn-row">
+        <button class="btn" id="btn-run">运转演示</button>
+        <button class="btn" id="btn-spin">自动环绕</button>
+      </div>
+    </div>
+    <div class="con-group">
+      <span class="con-label">转速</span>
+      <div class="slider-row">
+        <input type="range" id="rpm-slider" min="0" max="2000" step="10" value="600">
+        <span class="slider-val" id="rpm-val">600 rpm</span>
+      </div>
+    </div>
+    <div class="con-group">
+      <span class="con-label">显示</span>
+      <div class="btn-row">
+        <button class="btn" id="btn-labels">全部标注</button>
+        <button class="btn active" id="btn-help">引导</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+  <div id="loader">
+    <div class="ring"></div>
+    <div class="txt">Building EA839 Engine Model</div>
+  </div>
+</div>
+
+<script type="module" src="./js/main.js"></script>
+</body>
+</html>
